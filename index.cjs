@@ -1,7 +1,7 @@
 'use strict';
 // listening-stats/index.cjs — main 入口（Node 进程）
 // 职责：接收 client 的播放会话记录，用 Node fs 持久化到独立数据目录
-//   api.storage.paths.data (legacy %APPDATA% path migrated when safe)
+//   Electron app userData/mod-data/listening-stats (legacy %APPDATA% path migrated when safe)
 // 结构：
 //   songs.json          歌曲信息字典（key -> {title, artist, album, source}）
 //   agg.json            全量聚合（歌曲/歌手/专辑/每日/时段/音源/最近播放/趣味统计）
@@ -13,61 +13,162 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { shell } = require('electron');
+const { shell, app, dialog } = require('electron');
 
 const APP = 'Folia';
 const SUB = 'listening-stats';
 const RECENT_LIMIT = 150;
+const DEFAULT_COMPLETE_PERCENT = 50;
+let completePercent = DEFAULT_COMPLETE_PERCENT;
 
 function legacyDataRoot() {
   const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   return path.join(base, APP, SUB);
 }
 
+function locationConfigPath() {
+  try { if (app && typeof app.getPath === 'function') return path.join(app.getPath('userData'), 'mod-data', SUB + '-location.json'); } catch (e) {}
+  return null;
+}
+
+
+function customIconDir() {
+  try {
+    if (app && typeof app.getPath === 'function') return path.join(app.getPath('userData'), 'mod-data', SUB + '-icon');
+  } catch (_) {}
+  return null;
+}
+
+function readIconData() {
+  const dir = customIconDir();
+  let file = null;
+  if (dir && fs.existsSync(dir)) {
+    const found = fs.readdirSync(dir).find((name) => /^custom-icon\.(png|jpe?g|webp|gif)$/i.test(name));
+    if (found) file = path.join(dir, found);
+  }
+  if (!file) file = path.join(__dirname, 'preview.png');
+  const ext = path.extname(file).toLowerCase();
+  const mime = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/png';
+  const bytes = fs.readFileSync(file);
+  if (bytes.length > 2 * 1024 * 1024) throw new Error('图标文件不能超过 2 MB');
+  return 'data:' + mime + ';base64,' + bytes.toString('base64');
+}
+
+function validateImageBytes(ext, b) {
+  if (ext === '.png') return b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+  if (ext === '.jpg' || ext === '.jpeg') return b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+  if (ext === '.gif') return b.length >= 6 && (b.subarray(0, 6).toString('ascii') === 'GIF87a' || b.subarray(0, 6).toString('ascii') === 'GIF89a');
+  if (ext === '.webp') return b.length >= 12 && b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP';
+  return false;
+}
+
 function dataRoot() {
-  const configured = api && api.storage && api.storage.paths && api.storage.paths.data;
-  if (typeof configured === 'string' && configured.trim()) return configured;
-  return legacyDataRoot(); // Compatibility with older host API versions.
+  const configPath = locationConfigPath();
+  if (configPath) {
+    try { const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')); if (cfg && typeof cfg.path === 'string' && path.isAbsolute(cfg.path)) return path.resolve(cfg.path); } catch (e) {}
+  }
+  // Folium 2 may reject filesystem.data before the module starts. Do not access
+  // api.storage.paths.data here: use Electron's supported per-user app data path
+  // and isolate this module's files in its own subdirectory.
+  let userData;
+  try {
+    userData = app && typeof app.getPath === 'function' ? app.getPath('userData') : null;
+  } catch (e) {
+    userData = null;
+  }
+  if (typeof userData === 'string' && userData.trim()) {
+    return path.join(userData, 'mod-data', SUB);
+  }
+  // Last-resort compatibility fallback for environments without Electron app paths.
+  return legacyDataRoot();
 }
 
 function copyTreeSafe(source, destination) {
-  if (!fs.existsSync(source)) return;
-  fs.mkdirSync(destination, { recursive: true });
-  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
-    const from = path.join(source, entry.name), to = path.join(destination, entry.name);
-    if (entry.isDirectory()) copyTreeSafe(from, to);
-    else if (entry.isFile() && !fs.existsSync(to)) fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+  const st = fs.lstatSync(source);
+  if (st.isSymbolicLink()) throw new Error('refusing to migrate symbolic link: ' + source);
+  if (st.isDirectory()) {
+    fs.mkdirSync(destination, { recursive: true });
+    for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+      copyTreeSafe(path.join(source, entry.name), path.join(destination, entry.name));
+    }
+    return;
   }
+  if (!st.isFile()) throw new Error('unsupported file in legacy data: ' + source);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
 }
 
 function validateLegacyData(directory) {
+  let foundData = false;
   for (const name of ['songs.json', 'agg.json', 'session.json']) {
     const file = path.join(directory, name);
     if (!fs.existsSync(file)) continue;
+    foundData = true;
     const value = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid ' + name);
+    if (name === 'songs.json' && Object.values(value).some((v) => !v || typeof v !== 'object' || Array.isArray(v))) {
+      throw new Error('invalid song entries in songs.json');
+    }
+    if (name === 'agg.json' && value.totals != null && (typeof value.totals !== 'object' || Array.isArray(value.totals))) {
+      throw new Error('invalid totals in agg.json');
+    }
+    if (name === 'session.json' && value.song != null && (typeof value.song !== 'object' || Array.isArray(value.song))) {
+      throw new Error('invalid song in session.json');
+    }
   }
   const events = path.join(directory, 'events');
   if (fs.existsSync(events)) {
+    const st = fs.lstatSync(events);
+    if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('invalid events directory');
     for (const name of fs.readdirSync(events).filter((f) => f.endsWith('.ndjson'))) {
-      const content = fs.readFileSync(path.join(events, name), 'utf8');
-      for (const line of content.split('\n')) if (line.trim()) JSON.parse(line);
+      const file = path.join(events, name);
+      if (!fs.lstatSync(file).isFile()) throw new Error('invalid event file: ' + name);
+      const content = fs.readFileSync(file, 'utf8');
+      for (const line of content.split('\n')) {
+        if (!line.trim()) continue;
+        const ev = JSON.parse(line);
+        if (!ev || typeof ev !== 'object' || Array.isArray(ev)) throw new Error('invalid event in ' + name);
+      }
+      foundData = true;
     }
   }
+  if (!foundData) throw new Error('no recognized listening data found');
 }
 
 function migrateLegacyData() {
-  const target = dataRoot(), legacy = legacyDataRoot();
-  if (path.resolve(target) === path.resolve(legacy) || !fs.existsSync(legacy)) return;
-  let targetHasData = false;
-  try { targetHasData = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch (_) {}
-  if (targetHasData) return;
+  const target = path.resolve(dataRoot()), legacy = path.resolve(legacyDataRoot());
+  if (target === legacy || !fs.existsSync(legacy)) return;
   try {
+    // Never merge into or overwrite a populated destination.
+    if (fs.existsSync(target) && fs.readdirSync(target).length > 0) return;
     validateLegacyData(legacy);
-    copyTreeSafe(legacy, target);
-    if (api && api.log) api.log.info('listening-stats: migrated legacy data to mod data directory');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const staging = target + '.migration-' + process.pid + '-' + Date.now();
+    fs.rmSync(staging, { recursive: true, force: true });
+    copyTreeSafe(legacy, staging);
+    validateLegacyData(staging);
+
+    // Swap a fully validated staging directory into place. If the host has
+    // already created an empty data directory, temporarily move it aside.
+    let emptyTarget = null;
+    if (fs.existsSync(target)) {
+      if (fs.readdirSync(target).length > 0) {
+        fs.rmSync(staging, { recursive: true, force: true });
+        return;
+      }
+      emptyTarget = target + '.empty-' + process.pid + '-' + Date.now();
+      fs.renameSync(target, emptyTarget);
+    }
+    try {
+      fs.renameSync(staging, target);
+      if (emptyTarget) fs.rmSync(emptyTarget, { recursive: true, force: true });
+    } catch (e) {
+      if (emptyTarget && !fs.existsSync(target) && fs.existsSync(emptyTarget)) fs.renameSync(emptyTarget, target);
+      throw e;
+    }
+    if (api && api.log) api.log.info('listening-stats: legacy data validated and migrated');
   } catch (e) {
-    try { if (api) api.log.warn('listening-stats legacy migration failed; original data kept', String(e)); } catch (_) {}
+    try { if (api) api.log.warn('listening-stats legacy migration failed; original data kept and migration can be retried', String(e)); } catch (_) {}
   }
 }
 
@@ -116,10 +217,24 @@ function emptyAgg() {
   };
 }
 
+function loadSettings() {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(dataRoot(), 'settings.json'), 'utf8'));
+    const n = Number(value && value.completePercent);
+    completePercent = Number.isFinite(n) ? Math.max(1, Math.min(100, Math.round(n))) : DEFAULT_COMPLETE_PERCENT;
+  } catch (_) { completePercent = DEFAULT_COMPLETE_PERCENT; }
+}
+function saveSettings() {
+  const root = ensureDirs();
+  const target = path.join(root, 'settings.json');
+  const tmp = target + '.tmp-' + process.pid + '-' + Date.now();
+  fs.writeFileSync(tmp, JSON.stringify({ completePercent }, null, 2));
+  fs.renameSync(tmp, target);
+}
 function isComplete(rec) {
   const dur = Number(rec.dur) || 0;
   const secs = Number(rec.secs) || 0;
-  if (dur > 0) return secs >= Math.min(30, dur / 2);
+  if (dur > 0) return secs >= dur * completePercent / 100;
   return secs >= 30;
 }
 
@@ -128,6 +243,10 @@ function isComplete(rec) {
 let api = null;
 let state = null; // { songs, agg, session }
 let saveTimer = null;
+let clearingStats = false;
+const finalizedSessions = new Set();
+function sessionIdentity(song, startedAt) { return String(Number(startedAt) || 0) + ':' + songKey(song); }
+function rememberFinalized(id) { finalizedSessions.add(id); if (finalizedSessions.size > 1000) finalizedSessions.delete(finalizedSessions.values().next().value); }
 
 function load() {
   const root = dataRoot();
@@ -138,6 +257,7 @@ function load() {
   if (!agg.totals) agg = emptyAgg();
   if (!agg.hourly || agg.hourly.length !== 7) agg.hourly = emptyHourly();
 
+  loadSettings();
   state = { songs, agg, session: null };
 
   // 回填：1.3 之前的旧数据没有按小时明细，从流水重建（只补 hours 缺失的天，幂等）
@@ -189,50 +309,71 @@ function backfillHours() {
       day.hours[new Date(ts).getHours()] = (day.hours[new Date(ts).getHours()] || 0) + secs;
     }
   }
-  if (rebuilt) saveNow();
-}
-
-function atomicWriteSync(file, content) {
-  const tmp = file + '.tmp-' + process.pid;
-  fs.writeFileSync(tmp, content);
-  fs.renameSync(tmp, file);
-}
-
-function saveSessionNow() {
-  if (!state) return;
-  const root = dataRoot();
-  try {
-    fs.mkdirSync(root, { recursive: true });
-    const file = path.join(root, 'session.json');
-    if (state.session) atomicWriteSync(file, JSON.stringify(state.session));
-    else { try { fs.unlinkSync(file); } catch (_) {} }
-  } catch (e) { try { if (api) api.log.warn('stats session save failed', String(e)); } catch (_) {} }
+  if (rebuilt) saveNow().catch(() => {});
 }
 
 let writeChain = Promise.resolve();
+let tempFileCounter = 0;
+function atomicWriteSync(file, content) {
+  const tmp = file + '.tmp-' + process.pid + '-' + (++tempFileCounter);
+  try {
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    throw e;
+  }
+}
+
+function atomicWriteAsync(file, content) {
+  const tmp = file + '.tmp-' + process.pid + '-' + (++tempFileCounter);
+  return fs.promises.writeFile(tmp, content, 'utf8')
+    .then(() => fs.promises.rename(tmp, file))
+    .catch(async (e) => { await fs.promises.unlink(tmp).catch(() => {}); throw e; });
+}
+
+function enqueueWrite(task) {
+  const operation = writeChain.then(task);
+  // Keep the queue usable after a failed write, but return the original promise
+  // so callers such as clear/finalize can report failure accurately.
+  writeChain = operation.catch((e) => {
+    try { if (api) api.log.warn('stats persistence failed', String(e)); } catch (_) {}
+  });
+  return operation;
+}
+
+function saveSessionNow() {
+  if (!state) return Promise.resolve();
+  const sessionText = state.session ? JSON.stringify(state.session) : null;
+  const root = dataRoot();
+  return enqueueWrite(async () => {
+    await fs.promises.mkdir(root, { recursive: true });
+    const file = path.join(root, 'session.json');
+    if (sessionText !== null) await atomicWriteAsync(file, sessionText);
+    else await fs.promises.unlink(file).catch((e) => { if (e.code !== 'ENOENT') throw e; });
+  });
+}
+
 function saveNow() {
   if (!state) return Promise.resolve();
-  const root = dataRoot(), aggText = JSON.stringify(state.agg), songsText = JSON.stringify(state.songs);
+  const root = dataRoot();
+  // Snapshot at scheduling time; all file writes, including session writes,
+  // go through the same queue to avoid temporary-file races and stale ordering.
+  const aggText = JSON.stringify(state.agg), songsText = JSON.stringify(state.songs);
   const sessionText = state.session ? JSON.stringify(state.session) : null;
-  writeChain = writeChain.then(async () => {
+  return enqueueWrite(async () => {
     await fs.promises.mkdir(root, { recursive: true });
-    const atomicWrite = async (file, content) => {
-      const tmp = file + '.tmp-' + process.pid;
-      await fs.promises.writeFile(tmp, content, 'utf8');
-      await fs.promises.rename(tmp, file);
-    };
-    await atomicWrite(path.join(root, 'agg.json'), aggText);
-    await atomicWrite(path.join(root, 'songs.json'), songsText);
+    await atomicWriteAsync(path.join(root, 'agg.json'), aggText);
+    await atomicWriteAsync(path.join(root, 'songs.json'), songsText);
     const sessionFile = path.join(root, 'session.json');
-    if (sessionText !== null) await atomicWrite(sessionFile, sessionText);
-    else await fs.promises.unlink(sessionFile).catch(() => {});
-  }).catch((e) => { try { if (api) api.log.warn('stats save failed', String(e)); } catch (_) {} });
-  return writeChain;
+    if (sessionText !== null) await atomicWriteAsync(sessionFile, sessionText);
+    else await fs.promises.unlink(sessionFile).catch((e) => { if (e.code !== 'ENOENT') throw e; });
+  });
 }
 
 function saveSoon() {
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, 1500);
+  saveTimer = setTimeout(() => { saveTimer = null; saveNow().catch(() => {}); }, 1500);
 }
 
 function appendEvent(rec) {
@@ -397,36 +538,104 @@ function rangeAgg(start, end) {
 // ---------- RPC 处理器 ----------
 
 function registerRpc() {
-  api.rpc.handle('heartbeat', (payload) => {
-    if (!state) return null;
+  api.rpc.handle('getCustomIcon', () => {
+    try { return { ok: true, dataUrl: readIconData() }; }
+    catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  api.rpc.handle('chooseCustomIcon', async () => {
+    try {
+      if (!dialog || typeof dialog.showOpenDialog !== 'function') return { ok: false, error: '当前宿主不支持文件选择' };
+      const result = await dialog.showOpenDialog({
+        properties: ['openFile'],
+        title: '选择模组面板图标',
+        filters: [{ name: '图片文件', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
+      });
+      if (!result || result.canceled || !result.filePaths || !result.filePaths[0]) return { ok: false, canceled: true };
+      const source = result.filePaths[0];
+      const ext = path.extname(source).toLowerCase();
+      if (!['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return { ok: false, error: '仅支持 PNG、JPG、WEBP 或 GIF 图片' };
+      const bytes = await fs.promises.readFile(source);
+      if (bytes.length < 1 || bytes.length > 2 * 1024 * 1024) return { ok: false, error: '图标文件必须小于等于 2 MB' };
+      if (!validateImageBytes(ext, bytes)) return { ok: false, error: '文件内容与图片格式不匹配或文件已损坏' };
+      const dir = customIconDir();
+      if (!dir) return { ok: false, error: '无法确定模组设置目录' };
+      await fs.promises.mkdir(dir, { recursive: true });
+      const target = path.join(dir, 'custom-icon' + ext);
+      const token = process.pid + '-' + Date.now() + '-' + (++tempFileCounter);
+      const temp = target + '.tmp-' + token;
+      const previous = target + '.previous-' + token;
+      await fs.promises.writeFile(temp, bytes, { flag: 'wx' });
+      let movedPrevious = false;
+      try {
+        // Keep the previous icon recoverable until the new file is in place.
+        try { await fs.promises.rename(target, previous); movedPrevious = true; }
+        catch (e) { if (e.code !== 'ENOENT') throw e; }
+        await fs.promises.rename(temp, target);
+      } catch (e) {
+        await fs.promises.unlink(temp).catch(() => {});
+        if (movedPrevious) await fs.promises.rename(previous, target).catch(() => {});
+        throw e;
+      }
+      // The replacement is now committed; only now remove old extensions and backup.
+      for (const name of await fs.promises.readdir(dir)) {
+        if (/^custom-icon\.(png|jpe?g|webp|gif)$/i.test(name) && name !== path.basename(target)) {
+          await fs.promises.unlink(path.join(dir, name)).catch(() => {});
+        }
+      }
+      if (movedPrevious) await fs.promises.unlink(previous).catch(() => {});
+      return { ok: true, dataUrl: readIconData() };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+
+  api.rpc.handle('resetCustomIcon', async () => {
+    try {
+      const dir = customIconDir();
+      if (dir && fs.existsSync(dir)) {
+        for (const name of await fs.promises.readdir(dir)) {
+          if (/^custom-icon\.(png|jpe?g|webp|gif)$/i.test(name)) await fs.promises.unlink(path.join(dir, name));
+        }
+      }
+      return { ok: true, dataUrl: readIconData() };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  });
+  api.rpc.handle('getCompletePercent', () => ({ ok: true, percent: completePercent }));
+  api.rpc.handle('setCompletePercent', (payload) => {
+    const n = Number(payload && payload.percent);
+    if (!Number.isFinite(n) || n < 1 || n > 100) return { ok: false, error: '比例必须是 1 到 100 的整数' };
+    completePercent = Math.round(n);
+    saveSettings();
+    return { ok: true, percent: completePercent };
+  });
+
+  api.rpc.handle('heartbeat', async (payload) => {
+    if (!state || clearingStats) return { ok: false, error: 'statistics are being cleared' };
     const p = payload || {};
     const song = p.song && typeof p.song === 'object' ? p.song : null;
     const prev = state.session;
     const secs = Math.max(0, Math.floor(Number(p.secs) || 0));
-    if (!song || secs < 0) return null;
-    state.session = {
-      song,
-      secs,
-      liked: !!p.liked,
-      dur: Math.floor(Number(p.dur) || 0),
-      startedAt: Number(p.startedAt) || (prev && prev.song && songKey(prev.song) === songKey(song) ? prev.startedAt : Date.now()),
-    };
-    saveSessionNow();
+    if (!song) return { ok: false, error: 'invalid session' };
+    const startedAt = Number(p.startedAt) || (prev && prev.song && songKey(prev.song) === songKey(song) ? prev.startedAt : Date.now());
+    if (finalizedSessions.has(sessionIdentity(song, startedAt))) return { ok: true, ignored: true };
+    state.session = { song, secs, liked: !!p.liked, dur: Math.floor(Number(p.dur) || 0), startedAt };
+    await saveSessionNow();
     return { ok: true };
   });
 
-  api.rpc.handle('finalize', (payload) => {
-    if (!state) return { ok: true };
+  api.rpc.handle('finalize', async (payload) => {
+    if (!state || clearingStats) return { ok: false, error: 'statistics are being cleared' };
     const p = payload || {};
+    const song = p.song && typeof p.song === 'object' ? p.song : null;
+    const startedAt = Number(p.startedAt) || Date.now();
+    const id = sessionIdentity(song, startedAt);
+    if (finalizedSessions.has(id)) return { ok: true, duplicate: true };
+    rememberFinalized(id);
     state.session = null;
-    recordSession({
-      song: p.song && typeof p.song === 'object' ? p.song : null,
-      secs: Number(p.secs) || 0,
-      liked: !!p.liked,
-      dur: Number(p.dur) || 0,
-      ts: Number(p.startedAt) || Date.now(),
-    });
-    saveSessionNow();
+    recordSession({ song, secs: Number(p.secs) || 0, liked: !!p.liked, dur: Number(p.dur) || 0, ts: startedAt });
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    // Persist the finalized aggregates and removal of session.json in one queued task.
+    await saveNow();
     return { ok: true };
   });
 
@@ -457,28 +666,111 @@ function registerRpc() {
     return { outputPath: file };
   });
 
-  api.rpc.handle('clear', (payload) => {
+  api.rpc.handle('clear', async (payload) => {
     if (!state) return { ok: true };
-    const root = dataRoot();
-    state.agg = emptyAgg();
-    state.songs = {};
-    state.session = null;
-    saveNow();
+    if (clearingStats) return { ok: false, error: 'clear already in progress' };
+    clearingStats = true;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
     try {
-      for (const f of fs.readdirSync(path.join(root, 'events'))) {
-        if (f.endsWith('.ndjson')) fs.unlinkSync(path.join(root, 'events', f));
+      state.agg = emptyAgg();
+      state.songs = {};
+      state.session = null;
+      finalizedSessions.clear();
+      // Await persistence before removing the event history; never report success early.
+      await saveNow();
+      const root = dataRoot();
+      const eventDir = path.join(root, 'events');
+      for (const f of fs.readdirSync(eventDir, { withFileTypes: true })) {
+        if (f.isFile() && f.name.endsWith('.ndjson')) await fs.promises.unlink(path.join(eventDir, f.name));
       }
-    } catch (e) {}
-    if (payload && payload.includeBackups === true) {
-      try { const dir = path.join(root, 'backups'); for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f), { recursive: true, force: true }); } catch (_) {}
+      if (payload && payload.includeBackups === true) {
+        const backupDir = path.join(root, 'backups');
+        for (const f of fs.readdirSync(backupDir, { withFileTypes: true })) {
+          // Only remove generated JSON backup files; preserve unexpected folders/files.
+          if (f.isFile() && f.name.endsWith('.json')) await fs.promises.unlink(path.join(backupDir, f.name));
+        }
+      }
+      return { ok: true };
+    } catch (e) {
+      try { if (api) api.log.warn('stats clear incomplete', String(e)); } catch (_) {}
+      return { ok: false, error: String(e) };
+    } finally {
+      clearingStats = false;
     }
-    return { ok: true };
   });
 
   api.rpc.handle('openDir', () => {
     const root = ensureDirs();
     return shell.openPath(root).then((message) => ({ ok: !message, error: message || undefined }))
       .catch((e) => ({ ok: false, error: String(e) }));
+  });
+
+  api.rpc.handle('chooseDataDir', async () => {
+    try {
+      if (!dialog || typeof dialog.showOpenDialog !== 'function') return { ok: false, error: '当前宿主不支持目录选择' };
+      const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: '选择听歌统计数据保存目录' });
+      if (!result || result.canceled || !result.filePaths || !result.filePaths[0]) return { ok: false, canceled: true };
+      const chosen = path.resolve(result.filePaths[0]);
+      const current = path.resolve(dataRoot());
+      if (chosen === current) return { ok: true, path: current, unchanged: true };
+      await writeChain;
+      await saveNow();
+      await writeChain;
+      fs.mkdirSync(path.dirname(chosen), { recursive: true });
+      const targetExists = fs.existsSync(chosen);
+      if (targetExists && fs.readdirSync(chosen).length) {
+        // Existing destinations must already be valid listening-stats data; never merge arbitrary files.
+        validateLegacyData(chosen);
+      } else {
+        // Build and validate a complete sibling staging directory first. Swapping directory names
+        // on the same volume avoids exposing a half-copied destination after a crash.
+        const parent = path.dirname(chosen);
+        const base = path.basename(chosen);
+        const token = process.pid + '-' + Date.now();
+        const staging = path.join(parent, '.' + base + '.listening-stats-staging-' + token);
+        const emptyHold = path.join(parent, '.' + base + '.listening-stats-empty-' + token);
+        let heldEmptyTarget = false;
+        fs.mkdirSync(staging, { recursive: false });
+        try {
+          for (const name of fs.readdirSync(current)) copyTreeSafe(path.join(current, name), path.join(staging, name));
+          validateLegacyData(staging);
+          if (targetExists) {
+            fs.renameSync(chosen, emptyHold);
+            heldEmptyTarget = true;
+          }
+          try {
+            fs.renameSync(staging, chosen);
+          } catch (swapError) {
+            if (heldEmptyTarget && !fs.existsSync(chosen) && fs.existsSync(emptyHold)) fs.renameSync(emptyHold, chosen);
+            throw swapError;
+          }
+          if (heldEmptyTarget) await fs.promises.rm(emptyHold, { recursive: true, force: true });
+        } finally {
+          await fs.promises.rm(staging, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+      const cfgPath = locationConfigPath();
+      if (!cfgPath) return { ok: false, error: '无法保存目录配置' };
+      fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+      const tmp = cfgPath + '.tmp-' + process.pid + '-' + Date.now();
+      const oldCfg = cfgPath + '.previous-' + process.pid + '-' + Date.now();
+      fs.writeFileSync(tmp, JSON.stringify({ path: chosen }, null, 2), { flag: 'wx' });
+      let hadOldCfg = false;
+      try {
+        try { await fs.promises.rename(cfgPath, oldCfg); hadOldCfg = true; }
+        catch (e) { if (e.code !== 'ENOENT') throw e; }
+        await fs.promises.rename(tmp, cfgPath);
+      } catch (cfgError) {
+        await fs.promises.unlink(tmp).catch(() => {});
+        if (hadOldCfg) await fs.promises.rename(oldCfg, cfgPath).catch(() => {});
+        throw cfgError;
+      }
+      if (hadOldCfg) await fs.promises.unlink(oldCfg).catch(() => {});
+      load();
+      ensureDirs();
+      return { ok: true, path: chosen };
+    } catch (e) { return { ok: false, error: String(e) }; }
   });
 }
 
@@ -491,10 +783,12 @@ module.exports = function activate(mainApi) {
   load();
   registerRpc();
   api.log.info('listening-stats loaded, data dir: ' + dataRoot());
-  return () => {
+  return async () => {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
-    saveSessionNow();
-    saveNow();
+    // Drain pending writes and make a final consistent snapshot before deactivation.
+    await writeChain;
+    await saveNow();
+    await writeChain;
   };
 };
