@@ -1,15 +1,17 @@
 {
-    "folium": 1,
-    "id": "listening-stats",
-    "name": "本地听歌统计",
-    "version": "1.7.0",
-    "author": "HuashuRed",
-    "description": "全量记录本地听歌行为：今日/本周/上周/当月/当季/今年与累计时长、Top 榜单（前7名）、时段热力图（周/月/季/年/自定义）、最近播放 150 首（本会话可点击播放）、趣味统计；时间筛选为下拉选择器，支持「历史」按年份联动筛月份/季节。过去时段（上周/历史年月季）的榜单与趣味统计按播放流水精确聚合，无记录时明确显示空状态。数据存放在模组自己的数据目录（filesystem.data），更新卸载不丢失，首次启动自动迁移旧目录数据；支持导出备份，清空时可选择保留或删除备份。",
-    "main": "index.cjs",
-    "client": "client.mjs",
-    "preview": "preview.png",
-    "permissions": [
-        "playback.control",
-        "filesystem.data"
-    ]
+  "folium": 1,
+  "id": "listening-stats",
+  "name": "本地听歌统计",
+  "version": "1.7.1",
+  "author": "listening-stats contributors",
+  "description": "全量记录本地听歌行为：今日/本周/上周/当月/当季/今年与累计时长、Top 榜单（前7名）、时段热力图（周/月/季/年/自定义）、最近播放 150 首（本会话可点击播放）、趣味统计；时间筛选为下拉选择器，支持「历史」按年份联动筛月份/季节。过去时段（上周/历史年月季）的榜单与趣味统计按播放流水精确聚合，无记录时明确显示空状态；数据只存本机（模组专属数据目录），更新卸载不丢失，支持导出备份。",
+  "main": "index.cjs",
+  "client": "client.mjs",
+  "preview": "preview.png",
+  "permissions": [
+    "playback.control"
+  ],
+  "filesystem": {
+    "data": true
+  }
 }

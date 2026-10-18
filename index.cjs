@@ -1,7 +1,7 @@
 'use strict';
 // listening-stats/index.cjs — main 入口（Node 进程）
 // 职责：接收 client 的播放会话记录，用 Node fs 持久化到独立数据目录
-//   %APPDATA%\Folia\listening-stats\
+//   api.storage.paths.data (legacy %APPDATA% path migrated when safe)
 // 结构：
 //   songs.json          歌曲信息字典（key -> {title, artist, album, source}）
 //   agg.json            全量聚合（歌曲/歌手/专辑/每日/时段/音源/最近播放/趣味统计）
@@ -13,50 +13,61 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { shell } = require('electron');
 
 const APP = 'Folia';
 const SUB = 'listening-stats';
 const RECENT_LIMIT = 150;
-
-// 数据目录：优先用 Folia 为模组分配的数据目录（api.storage.paths.data，更新时保留）；
-// 仅当宿主 API 不可用（如独立调试）时回退到旧约定目录。
-function dataRoot() {
-  if (api && api.storage && api.storage.paths && api.storage.paths.data) return api.storage.paths.data;
-  return legacyDataRoot();
-}
 
 function legacyDataRoot() {
   const base = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
   return path.join(base, APP, SUB);
 }
 
-// 首次启动迁移：旧目录（%APPDATA%\Folia\listening-stats\）里已有的数据复制到模组数据目录。
-// 只在目标目录为空（全新安装）时执行一次；不删除旧目录，避免任何丢失风险。
-function migrateLegacy() {
-  if (!api || !api.storage || !api.storage.paths || !api.storage.paths.data) return;
-  const target = api.storage.paths.data;
-  const legacy = legacyDataRoot();
-  if (!legacy || legacy === target) return;
-  let targetHasData = false;
-  try { targetHasData = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch (e) { targetHasData = false; }
-  if (targetHasData) return;
-  if (!fs.existsSync(legacy)) return;
-  try {
-    fs.mkdirSync(target, { recursive: true });
-    for (const it of ['agg.json', 'songs.json', 'session.json', 'events', 'backups']) {
-      const s = path.join(legacy, it);
-      if (!fs.existsSync(s)) continue;
-      const d = path.join(target, it);
-      if (fs.statSync(s).isDirectory()) {
-        fs.mkdirSync(d, { recursive: true });
-        for (const f of fs.readdirSync(s)) fs.copyFileSync(path.join(s, f), path.join(d, f));
-      } else {
-        fs.copyFileSync(s, d);
-      }
+function dataRoot() {
+  const configured = api && api.storage && api.storage.paths && api.storage.paths.data;
+  if (typeof configured === 'string' && configured.trim()) return configured;
+  return legacyDataRoot(); // Compatibility with older host API versions.
+}
+
+function copyTreeSafe(source, destination) {
+  if (!fs.existsSync(source)) return;
+  fs.mkdirSync(destination, { recursive: true });
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name), to = path.join(destination, entry.name);
+    if (entry.isDirectory()) copyTreeSafe(from, to);
+    else if (entry.isFile() && !fs.existsSync(to)) fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
+  }
+}
+
+function validateLegacyData(directory) {
+  for (const name of ['songs.json', 'agg.json', 'session.json']) {
+    const file = path.join(directory, name);
+    if (!fs.existsSync(file)) continue;
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid ' + name);
+  }
+  const events = path.join(directory, 'events');
+  if (fs.existsSync(events)) {
+    for (const name of fs.readdirSync(events).filter((f) => f.endsWith('.ndjson'))) {
+      const content = fs.readFileSync(path.join(events, name), 'utf8');
+      for (const line of content.split('\n')) if (line.trim()) JSON.parse(line);
     }
-    try { if (api) api.log.info('listening-stats: migrated data from ' + legacy); } catch (err) {}
+  }
+}
+
+function migrateLegacyData() {
+  const target = dataRoot(), legacy = legacyDataRoot();
+  if (path.resolve(target) === path.resolve(legacy) || !fs.existsSync(legacy)) return;
+  let targetHasData = false;
+  try { targetHasData = fs.existsSync(target) && fs.readdirSync(target).length > 0; } catch (_) {}
+  if (targetHasData) return;
+  try {
+    validateLegacyData(legacy);
+    copyTreeSafe(legacy, target);
+    if (api && api.log) api.log.info('listening-stats: migrated legacy data to mod data directory');
   } catch (e) {
-    try { if (api) api.log.warn('listening-stats migrate failed', String(e)); } catch (err) {}
+    try { if (api) api.log.warn('listening-stats legacy migration failed; original data kept', String(e)); } catch (_) {}
   }
 }
 
@@ -178,48 +189,50 @@ function backfillHours() {
       day.hours[new Date(ts).getHours()] = (day.hours[new Date(ts).getHours()] || 0) + secs;
     }
   }
-  if (rebuilt) saveNow().catch(() => {});
+  if (rebuilt) saveNow();
 }
 
-// 原子写入：先写临时文件再 rename，避免半写损坏
-async function writeJsonAtomic(file, data) {
-  const tmp = file + '.tmp';
-  await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  await fs.promises.writeFile(tmp, JSON.stringify(data));
-  await fs.promises.rename(tmp, file);
+function atomicWriteSync(file, content) {
+  const tmp = file + '.tmp-' + process.pid;
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, file);
 }
 
-// 汇总文件落盘（异步原子）。只由播放结束（finalize）或防抖定时触发，
-// 不在心跳里调用——心跳只写 session.json。
-async function saveNow() {
+function saveSessionNow() {
   if (!state) return;
   const root = dataRoot();
   try {
-    await writeJsonAtomic(path.join(root, 'agg.json'), state.agg);
-    await writeJsonAtomic(path.join(root, 'songs.json'), state.songs);
-    if (state.session) {
-      await writeJsonAtomic(path.join(root, 'session.json'), state.session);
-    } else {
-      try { await fs.promises.unlink(path.join(root, 'session.json')); } catch (e) {}
-    }
-  } catch (e) {
-    try { if (api) api.log.warn('stats save failed', String(e)); } catch (err) {}
-  }
+    fs.mkdirSync(root, { recursive: true });
+    const file = path.join(root, 'session.json');
+    if (state.session) atomicWriteSync(file, JSON.stringify(state.session));
+    else { try { fs.unlinkSync(file); } catch (_) {} }
+  } catch (e) { try { if (api) api.log.warn('stats session save failed', String(e)); } catch (_) {} }
 }
 
-// 心跳只写进行中会话（轻量），不重写会持续增长的汇总文件
-async function saveSessionNow() {
-  if (!state) return;
-  try {
-    await writeJsonAtomic(path.join(dataRoot(), 'session.json'), state.session);
-  } catch (e) {
-    try { if (api) api.log.warn('session save failed', String(e)); } catch (err) {}
-  }
+let writeChain = Promise.resolve();
+function saveNow() {
+  if (!state) return Promise.resolve();
+  const root = dataRoot(), aggText = JSON.stringify(state.agg), songsText = JSON.stringify(state.songs);
+  const sessionText = state.session ? JSON.stringify(state.session) : null;
+  writeChain = writeChain.then(async () => {
+    await fs.promises.mkdir(root, { recursive: true });
+    const atomicWrite = async (file, content) => {
+      const tmp = file + '.tmp-' + process.pid;
+      await fs.promises.writeFile(tmp, content, 'utf8');
+      await fs.promises.rename(tmp, file);
+    };
+    await atomicWrite(path.join(root, 'agg.json'), aggText);
+    await atomicWrite(path.join(root, 'songs.json'), songsText);
+    const sessionFile = path.join(root, 'session.json');
+    if (sessionText !== null) await atomicWrite(sessionFile, sessionText);
+    else await fs.promises.unlink(sessionFile).catch(() => {});
+  }).catch((e) => { try { if (api) api.log.warn('stats save failed', String(e)); } catch (_) {} });
+  return writeChain;
 }
 
 function saveSoon() {
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { saveNow().catch(() => {}); }, 30000);
+  saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, 1500);
 }
 
 function appendEvent(rec) {
@@ -396,9 +409,8 @@ function registerRpc() {
       secs,
       liked: !!p.liked,
       dur: Math.floor(Number(p.dur) || 0),
-      startedAt: prev && prev.song && songKey(prev.song) === songKey(song) ? prev.startedAt : Date.now(),
+      startedAt: Number(p.startedAt) || (prev && prev.song && songKey(prev.song) === songKey(song) ? prev.startedAt : Date.now()),
     };
-    // 心跳只写轻量的 session.json，不重写汇总文件
     saveSessionNow();
     return { ok: true };
   });
@@ -414,6 +426,7 @@ function registerRpc() {
       dur: Number(p.dur) || 0,
       ts: Number(p.startedAt) || Date.now(),
     });
+    saveSessionNow();
     return { ok: true };
   });
 
@@ -450,33 +463,22 @@ function registerRpc() {
     state.agg = emptyAgg();
     state.songs = {};
     state.session = null;
-    saveNow().catch(() => {});
+    saveNow();
     try {
       for (const f of fs.readdirSync(path.join(root, 'events'))) {
         if (f.endsWith('.ndjson')) fs.unlinkSync(path.join(root, 'events', f));
       }
     } catch (e) {}
-    // 可选：连导出备份一起清空（界面询问后传入）
-    if (payload && payload.includeBackups) {
-      try {
-        const bk = path.join(root, 'backups');
-        if (fs.existsSync(bk)) for (const f of fs.readdirSync(bk)) fs.unlinkSync(path.join(bk, f));
-      } catch (e) {}
+    if (payload && payload.includeBackups === true) {
+      try { const dir = path.join(root, 'backups'); for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f), { recursive: true, force: true }); } catch (_) {}
     }
     return { ok: true };
   });
 
   api.rpc.handle('openDir', () => {
-    const root = dataRoot();
-    ensureDirs();
-    try {
-      const { shell } = require('electron');
-      shell.openPath(root);
-      return { ok: true };
-    } catch (e) {
-      try { if (api) api.log.warn('open dir failed', String(e)); } catch (err) {}
-      return { ok: false };
-    }
+    const root = ensureDirs();
+    return shell.openPath(root).then((message) => ({ ok: !message, error: message || undefined }))
+      .catch((e) => ({ ok: false, error: String(e) }));
   });
 }
 
@@ -484,13 +486,15 @@ function registerRpc() {
 
 module.exports = function activate(mainApi) {
   api = mainApi;
-  migrateLegacy();
+  migrateLegacyData();
   ensureDirs();
   load();
   registerRpc();
   api.log.info('listening-stats loaded, data dir: ' + dataRoot());
   return () => {
     if (saveTimer) clearTimeout(saveTimer);
-    saveNow().catch(() => {});
+    saveTimer = null;
+    saveSessionNow();
+    saveNow();
   };
 };
