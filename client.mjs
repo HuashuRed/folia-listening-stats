@@ -159,6 +159,12 @@ const dayStrOf = (ts) => {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 };
 
+// 'YYYY-MM-DD' 按本地时区解析为当天 00:00（避免 new Date('YYYY-MM-DD') 按 UTC 解析导致负时区差一天）
+const dayTs = (k) => {
+  const p = String(k).split('-').map(Number);
+  return new Date(p[0], p[1] - 1, p[2]).getTime();
+};
+
 export default function activate(folium) {
   if (folium.env.context !== 'main') return undefined;
 
@@ -212,6 +218,8 @@ export default function activate(folium) {
       dur: c.dur,
       startedAt: c.startedAt,
     }).catch(() => {});
+    // 每次播放结束让面板快照缓存失效，下次打开/刷新即见新数据
+    cached = null;
   };
 
   const heartbeat = () => {
@@ -272,6 +280,8 @@ export default function activate(folium) {
     label: { 'zh-CN': '统计', en: 'Stats' },
     order: 500,
     mount: (container) => {
+      // 每次打开面板都取最新快照，不用旧缓存
+      cached = null;
       const ui = buildPanel(container);
       return () => ui.dispose();
     },
@@ -336,6 +346,7 @@ export default function activate(folium) {
   });
 
   return () => {
+    finalize(); // 停用/卸载时结束当前这次播放，避免丢最后一段统计
     clearInterval(tick);
     clearInterval(beat);
     offSong();
@@ -666,19 +677,37 @@ export default function activate(folium) {
       mgrBody.appendChild(btn);
     });
     let armTimer = null;
+    const doClear = (withBackups) => {
+      const btn = mgrBody.querySelectorAll('.ls-mgr-btn')[2];
+      btn.dataset.armed = '';
+      btn.textContent = '清空统计';
+      const extra = mgrBody.querySelectorAll('.ls-mgr-btn')[3];
+      if (extra && extra.textContent.indexOf('删除备份') >= 0) extra.parentNode.removeChild(extra);
+      clearTimeout(armTimer);
+      folium.rpc.call('clear', { includeBackups: withBackups }).then(() => { cached = null; refresh(); }).catch(() => {});
+      folium.ui.toast(withBackups ? '已清空统计并删除全部备份' : '已清空全部统计（导出备份已保留）', { type: 'success', durationMs: 2200 });
+    };
     const mgrClear = () => {
       const btn = mgrBody.querySelectorAll('.ls-mgr-btn')[2];
       if (btn.dataset.armed !== '1') {
+        // 第一步：出现两个明确选项——保留备份清空 / 连备份一起删除
         btn.dataset.armed = '1';
-        btn.textContent = '再点一次确认清空';
+        btn.textContent = '清空（保留备份）';
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'ls-mgr-btn ls-danger';
+        del.textContent = '清空并删除备份';
+        del.addEventListener('click', () => { doClear(true); });
+        mgrBody.appendChild(del);
         clearTimeout(armTimer);
-        armTimer = setTimeout(() => { btn.dataset.armed = ''; btn.textContent = '清空统计'; }, 5000);
+        armTimer = setTimeout(() => {
+          btn.dataset.armed = '';
+          btn.textContent = '清空统计';
+          if (del.parentNode) del.parentNode.removeChild(del);
+        }, 8000);
         return;
       }
-      btn.dataset.armed = '';
-      btn.textContent = '清空统计';
-      folium.rpc.call('clear').then(() => { cached = null; refresh(); }).catch(() => {});
-      folium.ui.toast('已清空全部统计', { type: 'success', durationMs: 2000 });
+      doClear(false);
     };
 
     setView(activeView);
@@ -694,7 +723,7 @@ export default function activate(folium) {
     const start = rangeStart(period);
     let secs = 0;
     for (const k of Object.keys(daily)) {
-      if (new Date(k).getTime() >= start) secs += daily[k].secs || 0;
+      if (dayTs(k) >= start) secs += daily[k].secs || 0;
     }
     return secs;
   }
@@ -819,7 +848,7 @@ export default function activate(folium) {
     const daily = snap.agg.daily || {};
     const id = typeof period === 'string' ? period : period.id;
     const start = rangeStart(period);
-    const dates = Object.keys(daily).filter((k) => new Date(k).getTime() >= start).sort();
+    const dates = Object.keys(daily).filter((k) => dayTs(k) >= start).sort();
     const DAY_NAMES = ['日', '一', '二', '三', '四', '五', '六'];
     const isEmpty = () => { el.innerHTML = '<div class="ls-empty">该时间段暂无数据</div>'; };
 
@@ -995,7 +1024,7 @@ export default function activate(folium) {
       return '<div class="ls-recent-row' + (playable ? ' ls-playable' : '') + '" data-key="' + r.key + '">' +
         '<div class="ls-recent-main"><div class="ls-recent-name">' + esc(info.title || '未知歌曲') + '</div>' +
         '<div class="ls-recent-sub">' + esc(info.artist || '未知歌手') + (playable ? ' · 可播放' : ' · 本次启动前播放') + '</div></div>' +
-        '<div class="ls-recent-tag ' + (r.complete ? 'ls-tag-ok' : 'ls-tag-skip') + '">' + (r.complete ? '完整' : '跳过') + '</div>' +
+        '<div class="ls-recent-tag ' + (r.complete ? 'ls-tag-ok' : 'ls-tag-skip') + '" title="' + (r.complete ? '完整播放（播放过半或≥30秒）' : '未达完整播放判定（播放过半或≥30秒）') + '">' + (r.complete ? '完整' : '跳过') + '</div>' +
         '<div class="ls-recent-secs">' + fmt(r.secs) + '</div>' +
         '<div class="ls-recent-time">' + fmtDay(r.ts) + ' ' + fmtHm(r.ts) + '</div>' +
         '</div>';
@@ -1022,7 +1051,7 @@ export default function activate(folium) {
     const end = rangeEnd(period);
     // 区间内的天：含起点、不含终点（避免把本周的天算进"上周"等过去时段）
     const days = Object.keys(daily).filter((k) => {
-      const t = new Date(k).getTime();
+      const t = dayTs(k);
       return t >= start && t < end;
     }).sort();
     let pSecs = 0, pNight = 0, pWork = 0, pWeekend = 0, pSessions = 0, pComplete = 0, pSkip = 0;
@@ -1033,7 +1062,7 @@ export default function activate(folium) {
       pSessions += d.sessions || 0;
       pComplete += d.complete || 0;
       pSkip += d.skip || 0;
-      const dow = new Date(k).getDay();
+      const dow = new Date(dayTs(k)).getDay();
       if (dow >= 1 && dow <= 5) pWork += d.secs || 0; else pWeekend += d.secs || 0;
       if (d.hours) {
         for (let h = 0; h < 24; h += 1) {
@@ -1046,7 +1075,7 @@ export default function activate(folium) {
     // 范围内连续打卡
     let streak = 0, maxStreak = 0, run = 0, prev = null;
     for (const k of days) {
-      const t = new Date(k).getTime();
+      const t = dayTs(k);
       if (prev !== null && t - prev === 86400000) run += 1; else run = 1;
       if (run > maxStreak) maxStreak = run;
       prev = t;
