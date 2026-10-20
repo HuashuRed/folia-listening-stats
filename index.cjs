@@ -43,7 +43,16 @@ function readIconData() {
   const dir = customIconDir();
   let file = null;
   if (dir && fs.existsSync(dir)) {
-    const found = fs.readdirSync(dir).find((name) => /^custom-icon\.(png|jpe?g|webp|gif)$/i.test(name));
+    // 候选项排序保证选择稳定；只接受普通文件，拒绝符号链接（与迁移代码的标准一致，避免读取图标目录外的文件）
+    const found = fs.readdirSync(dir)
+      .filter((name) => /^custom-icon\.(png|jpe?g|webp|gif)$/i.test(name))
+      .sort()
+      .find((name) => {
+        try {
+          const st = fs.lstatSync(path.join(dir, name));
+          return st.isFile() && !st.isSymbolicLink();
+        } catch (e) { return false; }
+      });
     if (found) file = path.join(dir, found);
   }
   if (!file) file = path.join(__dirname, 'preview.png');
@@ -480,6 +489,32 @@ function recordSession(rec) {
 }
 
 // 按播放流水（events ndjson）精确聚合 [start, end) 区间内的歌曲/歌手/专辑。
+// 区间聚合的按月解析缓存：key=YYYY-MM.ndjson，value={ mtimeMs, rows }。
+// 事件追加后文件 mtime 变化，缓存按 mtime 自动失效；带数量上限，避免长期运行内存膨胀。
+const monthEventCache = new Map();
+const MONTH_CACHE_MAX = 120;
+function readMonthEvents(evDir, f) {
+  const file = path.join(evDir, f);
+  let mtimeMs;
+  try { mtimeMs = fs.statSync(file).mtimeMs; } catch (e) { return null; }
+  const hit = monthEventCache.get(f);
+  if (hit && hit.mtimeMs === mtimeMs) return hit.rows;
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { return null; }
+  const rows = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    try { rows.push(JSON.parse(t)); } catch (e) { /* 单行损坏不影响其余 */ }
+  }
+  monthEventCache.set(f, { mtimeMs, rows });
+  if (monthEventCache.size > MONTH_CACHE_MAX) {
+    const oldest = monthEventCache.keys().next().value;
+    monthEventCache.delete(oldest);
+  }
+  return rows;
+}
+
 // 用于过去时段（上周/历史年月季）的 Top 榜单与趣味统计——不用累计值 + lastTs 过滤，
 // 避免把最近播放的歌错误计入过去时段。
 function rangeAgg(start, end) {
@@ -493,15 +528,12 @@ function rangeAgg(start, end) {
   const ePref = end ? dateStr(end).slice(0, 7) : null;
   let minTs = 0, maxTs = 0;
   for (const f of files) {
-    if (f < sPref) continue;
-    if (ePref && f > ePref) continue;
-    let text;
-    try { text = fs.readFileSync(path.join(evDir, f), 'utf8'); } catch (e) { continue; }
-    for (const line of text.split('\n')) {
-      const t = line.trim();
-      if (!t) continue;
-      let ev;
-      try { ev = JSON.parse(t); } catch (e) { continue; }
+    const fm = f.slice(0, 7); // 月份前缀 'YYYY-MM'；直接用文件名比较会把当月文件（带 .ndjson 后缀）误判为大于前缀而跳过
+    if (fm < sPref) continue;
+    if (ePref && fm > ePref) continue;
+    const events = readMonthEvents(evDir, f); // 按月缓存解析结果，避免每次重复读取/解析同一文件
+    if (!events) continue;
+    for (const ev of events) {
       const ts = Number(ev && ev.ts);
       if (!ts || ts < start) continue;
       if (end && ts >= end) continue;
