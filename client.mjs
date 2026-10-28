@@ -271,6 +271,11 @@ export default function activate(folium) {
   window.addEventListener('beforeunload', onHide);
 
   // ---------------- 统计面板 ----------------
+  // 面板存活状态：buildPanel 与外部渲染函数（renderRank/renderFun）共享
+  let panelDisposed = true;
+  let panelRoot = null;
+  const alive = () => !panelDisposed && !!panelRoot && panelRoot.isConnected;
+
   let cached = null; // rpc snapshot 缓存
   const getSnapshot = () => (cached ? Promise.resolve(cached) : folium.rpc.call('snapshot').then((d) => { cached = d; return d; }));
 
@@ -504,11 +509,11 @@ export default function activate(folium) {
   function buildPanel(container) {
     cached = null;
     rangeCache.clear();
-    let disposed = false; // 面板销毁标记：异步结果返回后不再写入已移除的 DOM
+    panelDisposed = false;
     let renderSeq = 0; // 渲染序号：只允许最新一次刷新更新面板
-    const alive = () => !disposed && root.isConnected;
     const root = document.createElement('div');
     root.className = 'ls-root';
+    panelRoot = root;
     container.appendChild(root);
 
     const style = document.createElement('style');
@@ -665,7 +670,7 @@ export default function activate(folium) {
       // 不再无条件清理区间缓存：同一快照内切换栏目/榜单时复用区间结果，避免重复扫描流水文件；
       // 数据确实变化（显式刷新、清空、切换目录、finalize）时在对应位置单独清理
       getSnapshot().then((snap) => {
-        if (!snap || disposed || seq !== renderSeq) return;
+        if (!snap || panelDisposed || seq !== renderSeq) return;
         rankPicker.setYears(snap.agg.daily);
         heatPicker.setYears(snap.agg.daily);
         funPicker.setYears(snap.agg.daily);
@@ -759,7 +764,7 @@ export default function activate(folium) {
     setActive();
     refresh();
 
-    return { dispose: () => { disposed = true; clearTimeout(armTimer); root.remove(); } };
+    return { dispose: () => { panelDisposed = true; clearTimeout(armTimer); root.remove(); } };
   }
 
   // ---------------- 渲染函数 ----------------
@@ -1100,9 +1105,10 @@ export default function activate(folium) {
     const start = rangeStart(period);
     const end = rangeEnd(period);
     // 区间内的天：含起点、不含终点（避免把本周的天算进"上周"等过去时段）
+    // "全部"时段 end 为 null，不设上限
     const days = Object.keys(daily).filter((k) => {
       const t = parseLocalDate(k).getTime();
-      return t >= start && t < end;
+      return t >= start && (end == null || t < end);
     }).sort();
     let pSecs = 0, pNight = 0, pWork = 0, pWeekend = 0, pSessions = 0, pComplete = 0, pSkip = 0;
     const hours = Array(24).fill(0);
