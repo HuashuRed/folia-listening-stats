@@ -26,12 +26,6 @@ function legacyDataRoot() {
   return path.join(base, APP, SUB);
 }
 
-function locationConfigPath() {
-  try { if (app && typeof app.getPath === 'function') return path.join(app.getPath('userData'), 'mod-data', SUB + '-location.json'); } catch (e) {}
-  return null;
-}
-
-
 function customIconDir() {
   try {
     if (app && typeof app.getPath === 'function') return path.join(app.getPath('userData'), 'mod-data', SUB + '-icon');
@@ -72,13 +66,11 @@ function validateImageBytes(ext, b) {
 }
 
 function dataRoot() {
-  const configPath = locationConfigPath();
-  if (configPath) {
-    try { const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8')); if (cfg && typeof cfg.path === 'string' && path.isAbsolute(cfg.path)) return path.resolve(cfg.path); } catch (e) {}
-  }
   // Folium 2 may reject filesystem.data before the module starts. Do not access
   // api.storage.paths.data here: use Electron's supported per-user app data path
   // and isolate this module's files in its own subdirectory.
+  // A user-selectable data directory was removed: writing outside the module's
+  // own data directory violates the plugin market rules.
   let userData;
   try {
     userData = app && typeof app.getPath === 'function' ? app.getPath('userData') : null;
@@ -738,72 +730,6 @@ function registerRpc() {
       .catch((e) => ({ ok: false, error: String(e) }));
   });
 
-  api.rpc.handle('chooseDataDir', async () => {
-    try {
-      if (!dialog || typeof dialog.showOpenDialog !== 'function') return { ok: false, error: '当前宿主不支持目录选择' };
-      const result = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'], title: '选择听歌统计数据保存目录' });
-      if (!result || result.canceled || !result.filePaths || !result.filePaths[0]) return { ok: false, canceled: true };
-      const chosen = path.resolve(result.filePaths[0]);
-      const current = path.resolve(dataRoot());
-      if (chosen === current) return { ok: true, path: current, unchanged: true };
-      await writeChain;
-      await saveNow();
-      await writeChain;
-      fs.mkdirSync(path.dirname(chosen), { recursive: true });
-      const targetExists = fs.existsSync(chosen);
-      if (targetExists && fs.readdirSync(chosen).length) {
-        // Existing destinations must already be valid listening-stats data; never merge arbitrary files.
-        validateLegacyData(chosen);
-      } else {
-        // Build and validate a complete sibling staging directory first. Swapping directory names
-        // on the same volume avoids exposing a half-copied destination after a crash.
-        const parent = path.dirname(chosen);
-        const base = path.basename(chosen);
-        const token = process.pid + '-' + Date.now();
-        const staging = path.join(parent, '.' + base + '.listening-stats-staging-' + token);
-        const emptyHold = path.join(parent, '.' + base + '.listening-stats-empty-' + token);
-        let heldEmptyTarget = false;
-        fs.mkdirSync(staging, { recursive: false });
-        try {
-          for (const name of fs.readdirSync(current)) copyTreeSafe(path.join(current, name), path.join(staging, name));
-          validateLegacyData(staging);
-          if (targetExists) {
-            fs.renameSync(chosen, emptyHold);
-            heldEmptyTarget = true;
-          }
-          try {
-            fs.renameSync(staging, chosen);
-          } catch (swapError) {
-            if (heldEmptyTarget && !fs.existsSync(chosen) && fs.existsSync(emptyHold)) fs.renameSync(emptyHold, chosen);
-            throw swapError;
-          }
-          if (heldEmptyTarget) await fs.promises.rm(emptyHold, { recursive: true, force: true });
-        } finally {
-          await fs.promises.rm(staging, { recursive: true, force: true }).catch(() => {});
-        }
-      }
-      const cfgPath = locationConfigPath();
-      if (!cfgPath) return { ok: false, error: '无法保存目录配置' };
-      fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
-      const tmp = cfgPath + '.tmp-' + process.pid + '-' + Date.now();
-      const oldCfg = cfgPath + '.previous-' + process.pid + '-' + Date.now();
-      fs.writeFileSync(tmp, JSON.stringify({ path: chosen }, null, 2), { flag: 'wx' });
-      let hadOldCfg = false;
-      try {
-        try { await fs.promises.rename(cfgPath, oldCfg); hadOldCfg = true; }
-        catch (e) { if (e.code !== 'ENOENT') throw e; }
-        await fs.promises.rename(tmp, cfgPath);
-      } catch (cfgError) {
-        await fs.promises.unlink(tmp).catch(() => {});
-        if (hadOldCfg) await fs.promises.rename(oldCfg, cfgPath).catch(() => {});
-        throw cfgError;
-      }
-      if (hadOldCfg) await fs.promises.unlink(oldCfg).catch(() => {});
-      load();
-      ensureDirs();
-      return { ok: true, path: chosen };
-    } catch (e) { return { ok: false, error: String(e) }; }
-  });
 }
 
 // ---------- 入口 ----------
